@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import { api, streamChat } from "./api";
+import { api, friendlyError, streamChat } from "./api";
 import type { AgentEvent, ChatMessage, Job, Provider, Settings } from "./types";
 
 /* ── types ── */
@@ -30,6 +30,34 @@ function deriveTitle(msg: string): string {
   return msg.length > 24 ? msg.slice(0, 24) + "…" : msg;
 }
 
+/** Convert plain-text URLs into clickable <a> links */
+function linkify(text: string) {
+  const urlRegex = /(https?:\/\/[^\s<>"']+)/g;
+  const parts = text.split(urlRegex);
+  if (parts.length === 1) return text;
+  return parts.map((part, i) =>
+    urlRegex.test(part) ? (
+      <a key={i} href={part} target="_blank" rel="noreferrer">
+        {part}
+      </a>
+    ) : (
+      part
+    ),
+  );
+}
+
+/** Strip hallucinated markdown links — only keep URLs that match known jobs */
+function stripHallucinatedLinks(text: string, knownUrls: Set<string>): string {
+  // Remove markdown links [text](url) where url is not in knownUrls
+  return text.replace(/\[([^\]]*)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label, url) => {
+    if (knownUrls.has(url)) {
+      return `[${label}](${url})`;
+    }
+    // Keep the label text but remove the fake link
+    return label;
+  });
+}
+
 /* ── component ── */
 export default function App() {
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -49,13 +77,29 @@ export default function App() {
   const [apiKey, setApiKey] = useState("");
   const [keyword, setKeyword] = useState("python");
   const [location, setLocation] = useState("");
+  const [searchStatus, setSearchStatus] = useState("");
+  const [jobsPanelOpen, setJobsPanelOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
   const [ollamaModels, setOllamaModels] = useState<{ name: string; size: number; modified_at: string }[]>([]);
   const [pullingModel, setPullingModel] = useState("");
   const [pullProgress, setPullProgress] = useState("");
+  const [backendDown, setBackendDown] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // 后端健康检查：不可用时显示横幅，恢复后自动消失
+  useEffect(() => {
+    const check = () => {
+      api
+        .health()
+        .then(() => setBackendDown(false))
+        .catch(() => setBackendDown(true));
+    };
+    check();
+    const timer = window.setInterval(check, 10000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   // 加载 Ollama 模型列表
   useEffect(() => {
@@ -122,7 +166,8 @@ export default function App() {
   }, [active.messages]);
 
   useEffect(() => {
-    api.settings().then(setSettings).catch((e) => setError(String(e)));
+    // 首次加载失败时由健康检查横幅提示，不用重复报错
+    api.settings().then(setSettings).catch(() => undefined);
     api.providers().then((d) => {
       setProviders(d.providers);
       setSources(d.sources);
@@ -234,7 +279,7 @@ export default function App() {
         }
       });
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -242,13 +287,22 @@ export default function App() {
 
   /* ── job actions ── */
   async function onSearch() {
-    setBusy(true);
+    setSearchStatus("搜索中…");
     setError("");
+    setBusy(true);
     try {
       const res = await api.search(keyword, location, settings?.sources);
-      setJobs((prev) => mergeJobs(prev, res.jobs));
+      const count = res.jobs?.length ?? 0;
+      if (count === 0) {
+        setSearchStatus(`未找到匹配的岗位，试试其他关键词（如 "python remote"）`);
+      } else {
+        setSearchStatus(`找到 ${count} 个岗位`);
+        setJobs((prev) => mergeJobs(prev, res.jobs));
+        setJobsPanelOpen(true);
+      }
     } catch (err) {
-      setError(String(err));
+      setSearchStatus(`搜索失败：${friendlyError(err)}`);
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -279,7 +333,7 @@ export default function App() {
       setApiKey("");
       setShowSettings(false);
     } catch (err) {
-      setError(String(err));
+      setError(friendlyError(err));
     } finally {
       setBusy(false);
     }
@@ -357,6 +411,13 @@ export default function App() {
 
       {/* Main */}
       <main className="main">
+        {/* Backend offline banner */}
+        {backendDown && (
+          <div className="backend-banner">
+            ⚠️ 后端服务未连接，正在每 10 秒自动重试… 请在终端运行 <code>./start.sh</code>，或安装常驻服务：
+            <code>bash scripts/install_backend_service.sh</code>
+          </div>
+        )}
         {/* Top bar */}
         <header className="topbar">
           <button className="topbar-toggle" onClick={() => setSidebarOpen((v) => !v)}>
@@ -386,13 +447,6 @@ export default function App() {
               </div>
               <h2>开始找工作</h2>
               <p>描述你想找的方向，例如「远程 Python 后端，偏 FastAPI」</p>
-              <div className="empty-suggestions">
-                <button onClick={() => setDraft("远程 Python 后端，关键词 FastAPI, LangGraph")}>
-                  远程 Python 后端
-                </button>
-                <button onClick={() => setDraft("前端 React 工程师，旧金山湾区")}>前端 React 工程师</button>
-                <button onClick={() => setDraft("数据科学，远程，Python")}>数据科学</button>
-              </div>
             </div>
           ) : (
             active.messages.map((m) => (
@@ -411,7 +465,15 @@ export default function App() {
                 </div>
                 <div className="message-content">
                   <div className="message-role">{m.role === "user" ? "你" : "JobHunter"}</div>
-                  <div className="message-text">{m.content || "…"}</div>
+                  <div className="message-text">
+                    {m.content
+                      ? linkify(
+                          m.role === "assistant"
+                            ? stripHallucinatedLinks(m.content, new Set(jobs.map((j) => j.url)))
+                            : m.content,
+                        )
+                      : "…"}
+                  </div>
                 </div>
               </div>
             ))
@@ -419,36 +481,49 @@ export default function App() {
           <div ref={messagesEndRef} />
         </div>
 
-        {/* Jobs strip */}
+        {/* Jobs panel — collapsible */}
         {jobs.length > 0 && (
-          <div className="jobs-strip">
-            <div className="jobs-strip-header">
-              <span>最新岗位</span>
-              <span className="jobs-strip-count">{jobs.length} 个</span>
-            </div>
-            <div className="jobs-strip-scroll">
-              {jobs.slice(0, 6).map((job) => (
-                <div key={job.id} className="job-card">
-                  <div className="job-card-source">{job.source}</div>
-                  <div className="job-card-title">
-                    <a href={job.url} target="_blank" rel="noreferrer">
-                      {job.title}
-                    </a>
+          <div className="jobs-panel">
+            <button className="jobs-panel-toggle" onClick={() => setJobsPanelOpen((v) => !v)}>
+              <span>最新岗位 · {jobs.length} 个</span>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                style={{ transform: jobsPanelOpen ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 0.2s" }}
+              >
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+            {jobsPanelOpen && (
+              <div className="jobs-grid">
+                {jobs.map((job) => (
+                  <div key={job.id} className="job-card">
+                    <div className="job-card-source">{job.source}</div>
+                    <div className="job-card-title">
+                      <a href={job.url} target="_blank" rel="noreferrer">
+                        {job.title}
+                      </a>
+                    </div>
+                    <div className="job-card-company">
+                      {job.company} · {job.location || "Remote"}
+                    </div>
+                    {job.salary && <div className="job-card-salary">{job.salary}</div>}
+                    <button className="job-card-save" onClick={() => toggleSave(job)}>
+                      {job.saved ? "★" : "☆"}
+                    </button>
                   </div>
-                  <div className="job-card-company">
-                    {job.company} · {job.location || "Remote"}
-                  </div>
-                  <button className="job-card-save" onClick={() => toggleSave(job)}>
-                    {job.saved ? "★" : "☆"}
-                  </button>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
         {/* Search bar */}
-        <div className="search-bar">
+        <div className="search-bar" style={{ position: "relative", zIndex: 5 }}>
           <input
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
@@ -461,10 +536,32 @@ export default function App() {
             placeholder="地点（可选）"
             className="search-input"
           />
-          <button className="search-btn" onClick={onSearch} disabled={busy}>
-            筛选岗位
+          <button
+            className="search-btn"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onSearch();
+            }}
+            disabled={busy}
+            style={{ pointerEvents: "auto" }}
+          >
+            {busy ? "搜索中…" : "筛选岗位"}
           </button>
         </div>
+        {searchStatus && (
+          <div
+            style={{
+              textAlign: "center",
+              padding: "0 24px 8px",
+              fontSize: "13px",
+              color: searchStatus.includes("未找到") || searchStatus.includes("失败") ? "#ff3b30" : "#34c759",
+              fontWeight: 500,
+            }}
+          >
+            {searchStatus}
+          </div>
+        )}
 
         {/* Composer */}
         <form className="composer" onSubmit={onSend}>

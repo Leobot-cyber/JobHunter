@@ -1,14 +1,39 @@
 import type { AgentEvent, Job, Provider, Settings } from "./types";
 
+function extractError(text: string, fallback: string): string {
+  try {
+    const data = JSON.parse(text);
+    if (data && typeof data.detail === "string") return data.detail;
+  } catch {
+    /* not JSON */
+  }
+  return text || fallback;
+}
+
 async function parseJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(text || res.statusText);
+    throw new Error(extractError(text, res.statusText));
   }
   return res.json() as Promise<T>;
 }
 
+/** 把底层报错翻译成用户能看懂的提示 */
+export function friendlyError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (
+    msg.includes("Failed to fetch") ||
+    msg.includes("NetworkError") ||
+    msg.includes("ECONNREFUSED") ||
+    msg.includes("Internal Server Error")
+  ) {
+    return "后端服务未连接。请运行 ./start.sh 启动，或安装常驻服务：scripts/install_backend_service.sh";
+  }
+  return msg;
+}
+
 export const api = {
+  health: () => fetch("/api/health").then((r) => r.ok),
   settings: () => fetch("/api/settings").then((r) => parseJson<Settings>(r)),
   providers: () =>
     fetch("/api/providers").then((r) =>

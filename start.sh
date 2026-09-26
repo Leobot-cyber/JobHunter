@@ -14,14 +14,20 @@ if [[ ! -d frontend/node_modules ]]; then
   (cd frontend && npm install)
 fi
 
-export PYTHONPATH="$ROOT/backend"
-uvicorn app.main:app --app-dir backend --reload --port 8000 &
-API_PID=$!
+API_PID=""
+if lsof -ti :8000 >/dev/null 2>&1; then
+  echo "检测到 8000 端口已有后端服务（可能是 launchd 常驻服务），跳过后端启动"
+else
+  export PYTHONPATH="$ROOT/backend"
+  uvicorn app.main:app --app-dir backend --reload --port 8000 &
+  API_PID=$!
+fi
 (cd frontend && npm run dev) &
 UI_PID=$!
 
 cleanup() {
-  kill "$API_PID" "$UI_PID" 2>/dev/null || true
+  [[ -n "$API_PID" ]] && kill "$API_PID" 2>/dev/null || true
+  kill "$UI_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
